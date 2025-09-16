@@ -27,6 +27,20 @@ We offer examples in both raw-image folder and parquet shard formats. For other 
 3. Edit every `your_data_path` placeholder in **`data/dataset_info.py`**.
 4. *(Optional)*  Extend `DATASET_INFO` with your own parquet shards or JSONL files to mix extra data.
 
+### Reference-guided editing data
+
+The unified editing iterator also supports edit samples that provide **two conditioning images** instead of a text
+instruction. Supply the columns below inside each parquet row:
+
+* A **source** image, e.g. `source_image` (or store it as the first element of `image_list`).
+* One or more **reference** images under `reference_image_list`, `reference_list`, `reference_images`, `ref_image_list`,
+  or related keys. Every referenced image is fed to both the VAE and ViT encoders as conditioning.
+* A **target** image, e.g. `target_image` (or the final element inside `image_list`) that should receive the diffusion
+  loss.
+
+Any of the aliases listed above are accepted; pick the ones that best match your data export. Conditioning images are
+kept in the sequence without dropout so the model always observes both the source and the style/reference inputs.
+
 ---
 
 # Training
