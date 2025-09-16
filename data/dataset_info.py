@@ -37,3 +37,10 @@ DATASET_INFO = {
 		},
     },
 }
+
+
+DATASET_INFO["unified_edit"]["breast_edit"] = {
+  "data_dir": "/workspace/qwen-image-training/data/breast-edit-dataset/parquet",
+  "num_files": 1, "num_total_samples": 52,
+  "parquet_info_path": "/workspace/qwen-image-training/data/breast-edit-dataset/parquet_info.json"
+}
