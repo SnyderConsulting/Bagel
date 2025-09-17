@@ -3,6 +3,7 @@
 
 import functools
 import os
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -47,8 +48,35 @@ class FSDPConfig:
 
 def fsdp_wrapper(original_model, fsdp_config, ignored_modules=[]):
     if fsdp_config.sharding_strategy == 'HYBRID_SHARD':
+        world_size = dist.get_world_size()
+        if fsdp_config.num_replicate > world_size:
+            raise RuntimeError(
+                "FSDP HYBRID_SHARD requires num_replicate to be less than or equal to the "
+                f"world size (got num_replicate={fsdp_config.num_replicate}, world_size={world_size})."
+            )
+
+        requested_mesh_size = fsdp_config.num_replicate * fsdp_config.num_shard
+        if requested_mesh_size > world_size:
+            adjusted_num_shard = max(1, world_size // fsdp_config.num_replicate)
+            if adjusted_num_shard < fsdp_config.num_shard:
+                if dist.get_rank() == 0:
+                    warnings.warn(
+                        "Reducing FSDP num_shard from "
+                        f"{fsdp_config.num_shard} to {adjusted_num_shard} to match the available "
+                        f"world size ({world_size})."
+                    )
+                fsdp_config.num_shard = adjusted_num_shard
+                requested_mesh_size = fsdp_config.num_replicate * fsdp_config.num_shard
+
+        if requested_mesh_size != world_size:
+            raise RuntimeError(
+                "FSDP HYBRID_SHARD requires world size to equal num_replicate * num_shard "
+                f"(got world_size={world_size}, num_replicate={fsdp_config.num_replicate}, "
+                f"num_shard={fsdp_config.num_shard})."
+            )
+
         device_mesh = init_device_mesh(
-            "cuda", 
+            "cuda",
             mesh_shape=(fsdp_config.num_replicate, fsdp_config.num_shard),
             mesh_dim_names=("replicate", "shard")
         )
