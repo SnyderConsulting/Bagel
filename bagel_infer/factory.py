@@ -34,8 +34,22 @@ class InferenceProcessors:
     vit_transform: ImageTransform
 
 
-def _find_checkpoint_files(ckpt_dir: str) -> Tuple[Optional[str], Optional[str]]:
-    """Return candidate (ema, main) checkpoint files inside *ckpt_dir*."""
+def _find_checkpoint_files(
+    ckpt_dir: str, prefer_ema: bool = False
+) -> Tuple[Optional[str], Optional[str]]:
+    """Return preferred (primary, secondary) checkpoint files inside *ckpt_dir*."""
+
+    path = Path(ckpt_dir)
+    ema = next((str(p) for p in path.glob("*ema*.safetensors")), None)
+    full = next((str(p) for p in path.glob("model.safetensors")), None)
+
+    if prefer_ema:
+        primary, secondary = ema, full
+    else:
+        primary, secondary = full, ema
+
+    if primary or secondary:
+        return primary, secondary
 
     candidates = [
         "ema.safetensors",
@@ -45,10 +59,10 @@ def _find_checkpoint_files(ckpt_dir: str) -> Tuple[Optional[str], Optional[str]]
         "model.pt",
         "full_state_dict.pt",
     ]
-    found = [p for p in Path(ckpt_dir).glob("*") if p.name in candidates]
+    found = [p for p in path.glob("*") if p.name in candidates]
     ema = next((str(p) for p in found if "ema" in p.name), None)
     main = next((str(p) for p in found if "ema" not in p.name), None)
-    return ema, main
+    return (ema, main) if prefer_ema else (main, ema)
 
 
 def _step_dirs(root: str) -> list[Path]:
@@ -79,10 +93,14 @@ def resolve_checkpoint_dir(checkpoint_root: str, step: Optional[int]) -> str:
     return os.path.join(checkpoint_root, f"{step:0{width}d}")
 
 
-def load_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
+def load_checkpoint(
+    model: torch.nn.Module, ckpt: str, prefer_ema: bool = False
+) -> None:
     """Load model weights from *ckpt* (file or directory).
 
-    Prefers EMA weights when present and validates critical geometry.
+    Prefers consolidated weights (model.safetensors) unless *prefer_ema* is True
+    or the directory only contains EMA checkpoints. Also validates critical
+    geometry before loading.
     """
 
     def _infer_llm_h_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Optional[int]:
@@ -97,8 +115,8 @@ def load_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
         return None
 
     if os.path.isdir(ckpt):
-        ema, main = _find_checkpoint_files(ckpt)
-        ckpt_path = ema or main
+        primary, secondary = _find_checkpoint_files(ckpt, prefer_ema=prefer_ema)
+        ckpt_path = primary or secondary
         if ckpt_path is None:
             raise FileNotFoundError(f"No model weights found under {ckpt}")
         meta_path = os.path.join(ckpt, "checkpoint_meta.json")
@@ -136,9 +154,9 @@ def load_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"[load_checkpoint] loaded {ckpt_path}")
     if missing:
-        print(f"[load_checkpoint] missing keys: {len(missing)} (ok if frozen parts)")
+        print(f"[load_checkpoint] missing keys: {len(missing)} (frozen or absent)")
     if unexpected:
-        print(f"[load_checkpoint] unexpected keys: {len(unexpected)} (likely optimizer/FSDP)")
+        print(f"[load_checkpoint] unexpected keys: {len(unexpected)} (naming/ema extras)")
 
 
 def build_processors(
@@ -211,7 +229,13 @@ def build_model(
     device_obj = torch.device(device if device != "cuda" or torch.cuda.is_available() else "cpu")
 
     llm_config = _load_llm_config(llm_path)
+    llm_config.qk_norm = True
+    if hasattr(llm_config, "k_norm"):
+        llm_config.k_norm = True
+
     vit_config = _load_vit_config(vit_path)
+    if hasattr(vit_config, "rope"):
+        vit_config.rope = False
     vae_model, vae_config = load_ae(vae_path)
 
     bagel_config = _load_bagel_config(model_path) or BagelConfig()

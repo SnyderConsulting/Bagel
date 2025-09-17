@@ -27,6 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input_path", help="Optional single input image path (bypasses dataset mode)")
     parser.add_argument("--out_name", default="pred.png", help="Output filename for single-pair mode")
     parser.add_argument("--device", default="cuda", help="Device to run inference on")
+    parser.add_argument(
+        "--use_ema",
+        action="store_true",
+        help="Prefer EMA checkpoint weights instead of model.safetensors",
+    )
     parser.add_argument("--fp16", action="store_true", help="Enable FP16/bfloat16 autocast on CUDA")
     parser.add_argument("--num_timesteps", type=int, default=30, help="Number of denoising steps")
     parser.add_argument("--cfg_text_scale", type=float, default=1.0, help="Text guidance scale (keep 1.0 for no CFG)")
@@ -81,7 +86,7 @@ def main() -> None:
     print(
         f"[infer] built LLM hidden={model.language_model.config.hidden_size} (from --llm_path)"
     )
-    load_checkpoint(model, ckpt_dir)
+    load_checkpoint(model, ckpt_dir, prefer_ema=args.use_ema)
 
     if args.ref_path and args.input_path:
         from bagel_infer.pipeline import predict_single_edit
