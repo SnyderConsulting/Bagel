@@ -42,8 +42,29 @@ def predict_single_edit(
     ref_img = Image.open(ref_path).convert("RGB")
     in_img = Image.open(input_path).convert("RGB")
 
-    proc_ref = image_processor(images=ref_img, return_tensors="pt")
-    proc_in = image_processor(images=in_img, return_tensors="pt")
+    size_cfg = getattr(image_processor, "size", None)
+    crop_cfg = getattr(image_processor, "crop_size", None)
+    size_kw = None
+    if isinstance(size_cfg, dict):
+        if "height" in size_cfg and "width" in size_cfg:
+            size_kw = {
+                "height": int(size_cfg["height"]),
+                "width": int(size_cfg["width"]),
+            }
+        elif "shortest_edge" in size_cfg:
+            se = int(size_cfg["shortest_edge"])
+            size_kw = {"height": se, "width": se}
+    if size_kw is None:
+        size_kw = {"height": 980, "width": 980}
+
+    common = dict(
+        return_tensors="pt",
+        do_resize=True,
+        do_center_crop=False,
+        size=size_kw,
+    )
+    proc_ref = image_processor(images=ref_img, **common)
+    proc_in = image_processor(images=in_img, **common)
     pv_ref = proc_ref["pixel_values"].to(device_obj)
     pv_in = proc_in["pixel_values"].to(device_obj)
 
