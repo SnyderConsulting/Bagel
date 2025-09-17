@@ -101,6 +101,9 @@ class Qwen2Config(PretrainedConfig):
             The number of layers that use SWA (Sliding Window Attention). The bottom layers use SWA while the top use full attention.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
+        moe_mlp_chunk_size (`int`, *optional*, defaults to 2048):
+            Split size (in tokens) used to compute the MoE MLP projection in smaller chunks during training
+            and inference. Set to a non-positive value to disable chunking.
 
     ```python
     >>> from transformers import Qwen2Model, Qwen2Config
@@ -140,6 +143,7 @@ class Qwen2Config(PretrainedConfig):
         attention_dropout=0.0,
         is_causal=True,
         _attn_implementation="flash_attention_2",
+        moe_mlp_chunk_size=2048,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -166,6 +170,7 @@ class Qwen2Config(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.is_causal = is_causal
         self._attn_implementation = _attn_implementation
+        self.moe_mlp_chunk_size = moe_mlp_chunk_size
 
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
