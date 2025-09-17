@@ -1,6 +1,7 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
 import functools
 import os
 import warnings
@@ -46,7 +47,19 @@ class FSDPConfig:
         self.num_shard = num_shard
 
 
-def fsdp_wrapper(original_model, fsdp_config, ignored_modules=[]):
+def fsdp_wrapper(
+    original_model,
+    fsdp_config,
+    ignored_modules=None,
+    *,
+    param_dtype=torch.bfloat16,
+    reduce_dtype=torch.bfloat16,
+    buffer_dtype=torch.bfloat16,
+    device_id=None,
+    cpu_offload=None,
+):
+    if ignored_modules is None:
+        ignored_modules = []
     if fsdp_config.sharding_strategy == 'HYBRID_SHARD':
         world_size = dist.get_world_size()
         if fsdp_config.num_replicate > world_size:
@@ -82,6 +95,21 @@ def fsdp_wrapper(original_model, fsdp_config, ignored_modules=[]):
         )
     else:
         device_mesh = None
+    if device_id is None:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            device_id = dist.get_rank() % torch.cuda.device_count()
+        else:
+            device_id = None
+    if cpu_offload is None:
+        cpu_offload = fsdp_config.cpu_offload
+    if param_dtype is None and reduce_dtype is None and buffer_dtype is None:
+        mixed_precision = None
+    else:
+        mixed_precision = MixedPrecision(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            buffer_dtype=buffer_dtype,
+        )
     return FSDP(
         original_model,
         auto_wrap_policy=functools.partial(
@@ -98,15 +126,11 @@ def fsdp_wrapper(original_model, fsdp_config, ignored_modules=[]):
             },
         ),
         ignored_modules=ignored_modules,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        device_id=dist.get_rank() % torch.cuda.device_count(),
+        mixed_precision=mixed_precision,
+        device_id=device_id,
         sharding_strategy=ShardingStrategy[fsdp_config.sharding_strategy],
         backward_prefetch=BackwardPrefetch[fsdp_config.backward_prefetch],
-        cpu_offload=CPUOffload(offload_params=fsdp_config.cpu_offload),
+        cpu_offload=CPUOffload(offload_params=cpu_offload),
         device_mesh=device_mesh,
     )
 
@@ -272,11 +296,24 @@ def grad_checkpoint_check_fn(module):
     return isinstance(module, module_options)
 
 
-def fsdp_ema_setup(ema_model, fsdp_config, ignored_modules=[]):
+def fsdp_ema_setup(ema_model, fsdp_config, ignored_modules=None):
+    if ignored_modules is None:
+        ignored_modules = []
     for param in ema_model.parameters():
         param.requires_grad = False
 
-    ema_model = fsdp_wrapper(ema_model, fsdp_config, ignored_modules=ignored_modules)
+    ema_config = copy.deepcopy(fsdp_config)
+    ema_config.cpu_offload = True
+    ema_model = fsdp_wrapper(
+        ema_model,
+        ema_config,
+        ignored_modules=ignored_modules,
+        param_dtype=None,
+        reduce_dtype=None,
+        buffer_dtype=None,
+        device_id=None,
+        cpu_offload=True,
+    )
     return ema_model
 
 
@@ -290,8 +327,14 @@ def fsdp_ema_update(ema_model, model, decay=0.9999):
 
     for ema_handle, new_handle in zip(ema_handles, new_handles):
         if ema_handle.flat_param is not None and new_handle.flat_param.requires_grad:
-            ema_params.append(ema_handle.flat_param.data)
-            new_params.append(new_handle.flat_param.data.to(dtype=ema_handle.flat_param.dtype))
+            ema_flat_param = ema_handle.flat_param.data
+            ema_params.append(ema_flat_param)
+            new_params.append(
+                new_handle.flat_param.data.to(
+                    device=ema_flat_param.device,
+                    dtype=ema_flat_param.dtype,
+                )
+            )
 
     torch._foreach_mul_(ema_params, decay)
     torch._foreach_add_(ema_params, new_params, alpha=1 - decay)
