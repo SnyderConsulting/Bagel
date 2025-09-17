@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 from transformers import AutoConfig, AutoImageProcessor
+from transformers.models.siglip.configuration_siglip import SiglipConfig as HFSiglipConfig
 
 from data.data_utils import add_special_tokens
 from data.transforms import ImageTransform
@@ -182,6 +183,7 @@ def build_processors(
     vae_transform = ImageTransform(**vae_defaults)
     vit_transform = ImageTransform(**vit_defaults)
 
+    # If a preprocessor_config.json exists locally, this works fully offline.
     image_processor = AutoImageProcessor.from_pretrained(
         vit_path, local_files_only=True, trust_remote_code=False
     )
@@ -204,13 +206,41 @@ def _load_llm_config(llm_path: str) -> Qwen2Config:
     return Qwen2Config.from_dict(auto_cfg.to_dict())
 
 
-def _load_vit_config(vit_path: str) -> SiglipVisionConfig:
+def _load_vit_config(vit_path: str, model_path: str) -> SiglipVisionConfig:
+    """Load the SigLIP vision config used during training.
+
+    Prefers ``vit_config.json`` saved alongside the Bagel checkpoint to ensure
+    geometry matches the training graph. Falls back to reading the config from
+    ``vit_path`` (which must then be compatible with the stored weights).
+    """
+
+    vit_cfg_path = Path(model_path) / "vit_config.json"
+    if vit_cfg_path.is_file():
+        with open(vit_cfg_path, "r", encoding="utf-8") as f:
+            cfg_dict = json.load(f)
+        try:
+            hf_cfg = HFSiglipConfig(**cfg_dict)
+            vision_cfg_dict = (
+                hf_cfg.vision_config.to_dict()
+                if hasattr(hf_cfg.vision_config, "to_dict")
+                else hf_cfg.vision_config
+            )
+        except Exception:
+            vision_cfg_dict = cfg_dict
+        vit_cfg = SiglipVisionConfig.from_dict(vision_cfg_dict)
+        vit_cfg._name_or_path = vit_path
+        return vit_cfg
+
     auto_cfg = AutoConfig.from_pretrained(
-        vit_path, local_files_only=True, trust_remote_code=False
+        vit_path, local_files_only=True, trust_remote_code=True
     )
     if isinstance(auto_cfg, SiglipVisionConfig):
-        return auto_cfg
-    return SiglipVisionConfig.from_dict(auto_cfg.to_dict())
+        vit_cfg = auto_cfg
+    else:
+        vit_cfg = SiglipVisionConfig.from_dict(auto_cfg.to_dict())
+    if not getattr(vit_cfg, "_name_or_path", None):
+        vit_cfg._name_or_path = vit_path
+    return vit_cfg
 
 
 def _load_bagel_config(model_path: str) -> Optional[BagelConfig]:
@@ -244,7 +274,7 @@ def build_model(
     if hasattr(llm_config, "k_norm"):
         llm_config.k_norm = True
 
-    vit_config = _load_vit_config(vit_path)
+    vit_config = _load_vit_config(vit_path, model_path)
     if hasattr(vit_config, "rope"):
         vit_config.rope = False
     vae_model, vae_config = load_ae(vae_path)
@@ -272,6 +302,18 @@ def build_model(
         raise RuntimeError(
             "Mismatch between instantiated LLM hidden size and configuration from --llm_path: "
             f"model={built_hidden} vs cfg={llm_config.hidden_size}"
+        )
+
+    vit_hidden = getattr(vit_config, "hidden_size", None)
+    try:
+        built_vit_hidden = model.vision_model.config.hidden_size  # type: ignore[attr-defined]
+    except AttributeError:
+        built_vit_hidden = getattr(getattr(model, "vit_model", None), "config", None)
+        built_vit_hidden = getattr(built_vit_hidden, "hidden_size", None)
+    if vit_hidden is not None and built_vit_hidden is not None and built_vit_hidden != vit_hidden:
+        raise RuntimeError(
+            "Mismatch between instantiated ViT hidden size and configuration from vit_config: "
+            f"model={built_vit_hidden} vs cfg={vit_hidden}"
         )
     model.eval().to(device_obj)
 
