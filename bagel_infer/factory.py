@@ -50,13 +50,22 @@ def _find_checkpoint_files(ckpt_dir: str) -> Tuple[Optional[str], Optional[str]]
     return ema, main
 
 
+def _step_dirs(root: str) -> list[Path]:
+    """Return numeric step subdirectories inside *root*, sorted by step."""
+
+    return sorted(
+        [p for p in Path(root).iterdir() if p.is_dir() and p.name.isdigit()],
+        key=lambda p: int(p.name),
+    )
+
+
 def _latest_checkpoint_dir(root: str) -> str:
     """Return the numerically latest checkpoint directory inside *root*."""
 
-    dirs = [p for p in Path(root).glob("[0-9][0-9][0-9][0-9][0-9][0-9]") if p.is_dir()]
+    dirs = _step_dirs(root)
     if not dirs:
         raise FileNotFoundError(f"No step subdirs found in {root}")
-    return str(sorted(dirs, key=lambda p: int(p.name))[-1])
+    return str(dirs[-1])
 
 
 def resolve_checkpoint_dir(checkpoint_root: str, step: Optional[int]) -> str:
@@ -64,7 +73,9 @@ def resolve_checkpoint_dir(checkpoint_root: str, step: Optional[int]) -> str:
 
     if step is None:
         return _latest_checkpoint_dir(checkpoint_root)
-    return os.path.join(checkpoint_root, f"{step:07d}")
+    dirs = _step_dirs(checkpoint_root)
+    width = len(dirs[-1].name) if dirs else 7
+    return os.path.join(checkpoint_root, f"{step:0{width}d}")
 
 
 def load_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
