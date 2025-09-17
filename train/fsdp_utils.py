@@ -3,6 +3,7 @@
 
 import copy
 import functools
+import json
 import os
 import warnings
 
@@ -138,10 +139,35 @@ def fsdp_wrapper(
 
 class FSDPCheckpoint:
     @staticmethod
+    def _unwrap_model(model):
+        return model.module if hasattr(model, "module") else model
+
+    @staticmethod
+    def _safe_int(value):
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _infer_llm_hidden_from_state_dict(state_dict):
+        for key, value in state_dict.items():
+            if (
+                "language_model" in key
+                and "self_attn.q_proj.weight" in key
+                and hasattr(value, "ndim")
+                and value.ndim == 2
+            ):
+                return int(value.shape[0])
+        return None
+
+    @staticmethod
     def fsdp_save_ckpt(
-        ckpt_dir, 
-        train_steps, 
-        model, 
+        ckpt_dir,
+        train_steps,
+        model,
         ema_model, 
         optimizer, 
         scheduler, 
@@ -171,6 +197,27 @@ class FSDPCheckpoint:
             model_state_dict = model.state_dict()
             if dist.get_rank() == 0:
                 save_file(model_state_dict, os.path.join(save_path, "model.safetensors"))
+                base_model = FSDPCheckpoint._unwrap_model(model)
+                bagel_config = getattr(base_model, "config", None)
+                vit_model = getattr(base_model, "vit_model", None)
+                vit_config = getattr(vit_model, "config", None)
+                meta = {
+                    "llm_hidden_size": FSDPCheckpoint._safe_int(
+                        getattr(base_model.language_model.config, "hidden_size", None)
+                    ),
+                    "llm_arch": getattr(base_model.language_model.config, "model_type", "unknown"),
+                    "vit_hidden_size": FSDPCheckpoint._safe_int(
+                        getattr(vit_config, "hidden_size", None)
+                    ),
+                    "max_latent_size": FSDPCheckpoint._safe_int(
+                        getattr(bagel_config, "max_latent_size", None)
+                    ),
+                    "latent_patch_size": FSDPCheckpoint._safe_int(
+                        getattr(bagel_config, "latent_patch_size", None)
+                    ),
+                }
+                with open(os.path.join(save_path, "checkpoint_meta.json"), "w") as f:
+                    json.dump(meta, f, indent=2)
 
         with FSDP.state_dict_type(model, StateDictType.LOCAL_STATE_DICT):
             if fsdp_config.sharding_strategy == "FULL_SHARD":
@@ -211,6 +258,23 @@ class FSDPCheckpoint:
             else:
                 model_state_dict_path = os.path.join(resume_from, f"model.safetensors")
             model_state_dict = load_file(model_state_dict_path, device="cpu")
+            meta_path = os.path.join(resume_from, "checkpoint_meta.json")
+            ckpt_hidden = None
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r") as f:
+                        meta = json.load(f)
+                    ckpt_hidden = FSDPCheckpoint._safe_int(meta.get("llm_hidden_size"))
+                except Exception:
+                    ckpt_hidden = None
+            if ckpt_hidden is None:
+                ckpt_hidden = FSDPCheckpoint._infer_llm_hidden_from_state_dict(model_state_dict)
+            built_hidden = FSDPCheckpoint._unwrap_model(model).language_model.config.hidden_size
+            if ckpt_hidden and built_hidden != ckpt_hidden:
+                raise RuntimeError(
+                    "Checkpoint LLM hidden size does not match the constructed model. "
+                    f"checkpoint hidden_size={ckpt_hidden}, built hidden_size={built_hidden}."
+                )
             # NOTE position embeds are fixed sinusoidal embeddings, so we can just pop it off,
             # which makes it easier to adapt to different resolutions.
             model_state_dict.pop('latent_pos_embed.pos_embed')
