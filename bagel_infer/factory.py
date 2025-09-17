@@ -9,8 +9,6 @@ from typing import Dict, Optional, Tuple
 
 import torch
 from transformers import AutoConfig, AutoImageProcessor
-from transformers.models.siglip.configuration_siglip import SiglipConfig as HFSiglipConfig
-
 from data.data_utils import add_special_tokens
 from data.transforms import ImageTransform
 from modeling.autoencoder import load_ae
@@ -206,6 +204,25 @@ def _load_llm_config(llm_path: str) -> Qwen2Config:
     return Qwen2Config.from_dict(auto_cfg.to_dict())
 
 
+def _extract_vit_geometry(cfg_dict: dict) -> dict:
+    """
+    Return a flat dict with at least: hidden_size, num_attention_heads, intermediate_size.
+    Handles both HF SiglipConfig (with nested 'vision_config') and plain vision configs.
+    """
+
+    v = cfg_dict.get("vision_config") or cfg_dict
+    out = {
+        "hidden_size": v.get("hidden_size"),
+        "num_attention_heads": v.get("num_attention_heads"),
+        "intermediate_size": v.get("intermediate_size") or v.get("mlp_dim"),
+    }
+    # Optional extras that some configs carry
+    for k in ("patch_size", "image_size", "rope", "qkv_bias", "layer_norm_eps", "num_hidden_layers"):
+        if k in v:
+            out[k] = v[k]
+    return out
+
+
 def _load_vit_config(vit_path: str, model_path: str) -> SiglipVisionConfig:
     """Load the SigLIP vision config used during training.
 
@@ -218,16 +235,19 @@ def _load_vit_config(vit_path: str, model_path: str) -> SiglipVisionConfig:
     if vit_cfg_path.is_file():
         with open(vit_cfg_path, "r", encoding="utf-8") as f:
             cfg_dict = json.load(f)
-        try:
-            hf_cfg = HFSiglipConfig(**cfg_dict)
-            vision_cfg_dict = (
-                hf_cfg.vision_config.to_dict()
-                if hasattr(hf_cfg.vision_config, "to_dict")
-                else hf_cfg.vision_config
-            )
-        except Exception:
-            vision_cfg_dict = cfg_dict
-        vit_cfg = SiglipVisionConfig.from_dict(vision_cfg_dict)
+        # Extract geometry robustly
+        geom = _extract_vit_geometry(cfg_dict)
+        vit_cfg = SiglipVisionConfig.from_dict(geom)
+        # Force critical dims in case from_dict applied defaults
+        if geom.get("hidden_size") is not None:
+            vit_cfg.hidden_size = geom["hidden_size"]
+        if geom.get("num_attention_heads") is not None:
+            vit_cfg.num_attention_heads = geom["num_attention_heads"]
+        if geom.get("intermediate_size") is not None:
+            vit_cfg.intermediate_size = geom["intermediate_size"]
+        # Optional flags set during training
+        if "rope" in geom:
+            vit_cfg.rope = geom["rope"]
         vit_cfg._name_or_path = vit_path
         return vit_cfg
 
@@ -304,7 +324,14 @@ def build_model(
             f"model={built_hidden} vs cfg={llm_config.hidden_size}"
         )
 
-    vit_hidden = getattr(vit_config, "hidden_size", None)
+    def _get_hidden_size_from_cfg(cfg):
+        hs = getattr(cfg, "hidden_size", None)
+        if hs is not None:
+            return hs
+        vc = getattr(cfg, "vision_config", None)
+        return getattr(vc, "hidden_size", None)
+
+    vit_hidden = _get_hidden_size_from_cfg(vit_config)
     try:
         built_vit_hidden = model.vision_model.config.hidden_size  # type: ignore[attr-defined]
     except AttributeError:
