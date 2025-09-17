@@ -43,6 +43,25 @@ torch._dynamo.config.accumulated_cache_size_limit = 4096
 flex_attention = torch.compile(flex_attention)
 
 
+def chunked_mlp_forward(module: nn.Module, hidden_states: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    if isinstance(chunk_size, torch.Tensor):
+        chunk_size = int(chunk_size.item())
+    if hidden_states.size(0) == 0:
+        return module(hidden_states)
+    if chunk_size is None or chunk_size <= 0 or hidden_states.size(0) <= chunk_size:
+        return module(hidden_states)
+
+    output_chunks = []
+    for hidden_chunk in hidden_states.split(chunk_size, dim=0):
+        if hidden_chunk.size(0) == 0:
+            continue
+        output_chunks.append(module(hidden_chunk))
+
+    if not output_chunks:
+        return module(hidden_states)
+    return torch.cat(output_chunks, dim=0)
+
+
 class Qwen2Config(_Qwen2Config):
     r"""
     This is the configuration class to store the configuration of a [`Qwen2Model`]. It is used to instantiate a
@@ -132,6 +151,9 @@ class Qwen2Config(_Qwen2Config):
             The number of layers that use SWA (Sliding Window Attention). The bottom layers use SWA while the top use full attention.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
+        moe_mlp_chunk_size (`int`, *optional*, defaults to 2048):
+            Split size (in tokens) used to evaluate the generation MoE MLP on smaller chunks to lower peak
+            activation memory. Set to a non-positive value to disable chunking.
 
     ```python
     >>> from transformers import Qwen2Model, Qwen2Config
@@ -174,6 +196,7 @@ class Qwen2Config(_Qwen2Config):
         qk_norm=True,
         layer_module="Qwen2DecoderLayer",
         freeze_und=False,
+        moe_mlp_chunk_size=2048,
         **kwargs,
     ):
         super().__init__(
@@ -197,6 +220,7 @@ class Qwen2Config(_Qwen2Config):
             attention_dropout=attention_dropout,
             is_causal=is_causal,
             _attn_implementation=_attn_implementation,
+            moe_mlp_chunk_size=moe_mlp_chunk_size,
             **kwargs,
         )
         self.qk_norm = qk_norm
@@ -694,6 +718,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.freeze_und = config.freeze_und
+        self.mlp_chunk_size = config.moe_mlp_chunk_size
 
         self.self_attn = attn_module(config, layer_idx)
 
@@ -747,8 +772,11 @@ class Qwen2MoTDecoderLayer(nn.Module):
         if self.freeze_und:
             packed_sequence_[packed_und_token_indexes] = packed_sequence_[packed_und_token_indexes].detach()
     
-        packed_sequence_[packed_gen_token_indexes] = self.mlp_moe_gen(
-            self.post_attention_layernorm_moe_gen(packed_sequence[packed_gen_token_indexes])
+        packed_gen_sequence = self.post_attention_layernorm_moe_gen(
+            packed_sequence[packed_gen_token_indexes]
+        )
+        packed_sequence_[packed_gen_token_indexes] = chunked_mlp_forward(
+            self.mlp_moe_gen, packed_gen_sequence, self.mlp_chunk_size
         )
         packed_sequence = residual + packed_sequence_
 
@@ -816,7 +844,9 @@ class Qwen2MoTDecoderLayer(nn.Module):
 
                 packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
                 packed_query_sequence_[packed_text_indexes] = self.mlp(packed_text_query_sequence)
-                packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
+                packed_query_sequence_[packed_vae_token_indexes] = chunked_mlp_forward(
+                    self.mlp_moe_gen, packed_vae_query_sequence, self.mlp_chunk_size
+                )
                 packed_query_sequence = packed_query_sequence_
 
             packed_query_sequence = residual + packed_query_sequence
@@ -835,6 +865,7 @@ class Qwen2MoEDecoderLayer(nn.Module):
     def __init__(self, config, layer_idx: Optional[int] = None):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.mlp_chunk_size = config.moe_mlp_chunk_size
 
         self.self_attn = PackedAttention(config, layer_idx)
 
@@ -877,7 +908,9 @@ class Qwen2MoEDecoderLayer(nn.Module):
 
         packed_sequence_new = packed_sequence.new_zeros(packed_sequence.shape)
         packed_sequence_und = self.mlp(packed_sequence[packed_und_token_indexes])
-        packed_sequence_gen = self.mlp_moe_gen(packed_sequence[packed_gen_token_indexes])
+        packed_sequence_gen = chunked_mlp_forward(
+            self.mlp_moe_gen, packed_sequence[packed_gen_token_indexes], self.mlp_chunk_size
+        )
         packed_sequence_new[packed_und_token_indexes] = packed_sequence_und
         packed_sequence_new[packed_gen_token_indexes] = packed_sequence_gen
 
@@ -926,7 +959,9 @@ class Qwen2MoEDecoderLayer(nn.Module):
         elif mode == "gen":
             packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
             packed_query_sequence_[packed_text_indexes] = self.mlp(packed_query_sequence[packed_text_indexes])
-            packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_query_sequence[packed_vae_token_indexes])
+            packed_query_sequence_[packed_vae_token_indexes] = chunked_mlp_forward(
+                self.mlp_moe_gen, packed_query_sequence[packed_vae_token_indexes], self.mlp_chunk_size
+            )
             packed_query_sequence = packed_query_sequence_
         packed_query_sequence = residual + packed_query_sequence
 
