@@ -78,6 +78,9 @@ def main() -> None:
         latent_patch_size=2,
         vit_max_num_patch_per_side=30,
     )
+    print(
+        f"[infer] built LLM hidden={model.language_model.config.hidden_size} (from --llm_path)"
+    )
     load_checkpoint(model, ckpt_dir)
 
     if args.ref_path and args.input_path:

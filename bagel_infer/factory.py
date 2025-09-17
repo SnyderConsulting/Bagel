@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import torch
+from transformers import AutoConfig
 
 from data.data_utils import add_special_tokens
 from data.transforms import ImageTransform
@@ -81,16 +82,29 @@ def resolve_checkpoint_dir(checkpoint_root: str, step: Optional[int]) -> str:
 def load_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
     """Load model weights from *ckpt* (file or directory).
 
-    Prefers EMA weights when present.
+    Prefers EMA weights when present and validates critical geometry.
     """
+
+    def _infer_llm_h_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Optional[int]:
+        for key, value in state_dict.items():
+            if (
+                "language_model" in key
+                and "self_attn.q_proj.weight" in key
+                and hasattr(value, "ndim")
+                and value.ndim == 2
+            ):
+                return int(value.shape[0])
+        return None
 
     if os.path.isdir(ckpt):
         ema, main = _find_checkpoint_files(ckpt)
         ckpt_path = ema or main
         if ckpt_path is None:
             raise FileNotFoundError(f"No model weights found under {ckpt}")
+        meta_path = os.path.join(ckpt, "checkpoint_meta.json")
     else:
         ckpt_path = ckpt
+        meta_path = os.path.join(os.path.dirname(ckpt_path), "checkpoint_meta.json")
 
     ext = os.path.splitext(ckpt_path)[1]
     if ext == ".safetensors":
@@ -99,6 +113,25 @@ def load_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
         state_dict = load_file(ckpt_path)
     else:
         state_dict = torch.load(ckpt_path, map_location="cpu")
+
+    ckpt_hidden: Optional[int] = None
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            ckpt_hidden = int(meta.get("llm_hidden_size")) if meta.get("llm_hidden_size") else None
+        except Exception:
+            ckpt_hidden = None
+    if ckpt_hidden is None:
+        ckpt_hidden = _infer_llm_h_from_state_dict(state_dict)
+
+    built_hidden = model.language_model.config.hidden_size
+    if ckpt_hidden and built_hidden != ckpt_hidden:
+        raise RuntimeError(
+            "Checkpoint/graph mismatch detected: "
+            f"checkpoint hidden_size={ckpt_hidden} vs built model hidden_size={built_hidden}. "
+            "Set --llm_path to the config used during training or rebuild the model with that config."
+        )
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"[load_checkpoint] loaded {ckpt_path}")
@@ -137,18 +170,18 @@ def build_processors(
     )
 
 
-def _load_llm_config(model_path: str, llm_path: str) -> Qwen2Config:
-    cfg_path = Path(model_path) / "llm_config.json"
-    if cfg_path.exists():
-        return Qwen2Config.from_json_file(str(cfg_path))
-    return Qwen2Config.from_pretrained(llm_path)
+def _load_llm_config(llm_path: str) -> Qwen2Config:
+    auto_cfg = AutoConfig.from_pretrained(llm_path, trust_remote_code=True)
+    if isinstance(auto_cfg, Qwen2Config):
+        return auto_cfg
+    return Qwen2Config.from_dict(auto_cfg.to_dict())
 
 
-def _load_vit_config(model_path: str, vit_path: str) -> SiglipVisionConfig:
-    cfg_path = Path(model_path) / "vit_config.json"
-    if cfg_path.exists():
-        return SiglipVisionConfig.from_json_file(str(cfg_path))
-    return SiglipVisionConfig.from_pretrained(vit_path)
+def _load_vit_config(vit_path: str) -> SiglipVisionConfig:
+    auto_cfg = AutoConfig.from_pretrained(vit_path, trust_remote_code=True)
+    if isinstance(auto_cfg, SiglipVisionConfig):
+        return auto_cfg
+    return SiglipVisionConfig.from_dict(auto_cfg.to_dict())
 
 
 def _load_bagel_config(model_path: str) -> Optional[BagelConfig]:
@@ -177,8 +210,8 @@ def build_model(
     torch.set_grad_enabled(False)
     device_obj = torch.device(device if device != "cuda" or torch.cuda.is_available() else "cpu")
 
-    llm_config = _load_llm_config(model_path, llm_path)
-    vit_config = _load_vit_config(model_path, vit_path)
+    llm_config = _load_llm_config(llm_path)
+    vit_config = _load_vit_config(vit_path)
     vae_model, vae_config = load_ae(vae_path)
 
     bagel_config = _load_bagel_config(model_path) or BagelConfig()
@@ -199,6 +232,12 @@ def build_model(
             converter(vit_config)
 
     model = Bagel(language_model, vit_model, bagel_config)
+    built_hidden = model.language_model.config.hidden_size
+    if built_hidden != llm_config.hidden_size:
+        raise RuntimeError(
+            "Mismatch between instantiated LLM hidden size and configuration from --llm_path: "
+            f"model={built_hidden} vs cfg={llm_config.hidden_size}"
+        )
     model.eval().to(device_obj)
 
     vae_model = vae_model.to(device_obj).eval()
