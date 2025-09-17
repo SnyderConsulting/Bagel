@@ -61,6 +61,7 @@ def main() -> None:
 
     processors = build_processors(
         args.llm_path,
+        args.vit_path,
         vae_kwargs=dict(
             max_image_size=args.vae_max_image_size,
             min_image_size=args.vae_min_image_size,
