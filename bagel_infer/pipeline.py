@@ -22,6 +22,30 @@ def load_image(path: str) -> Image.Image:
     return pil_img2rgb(image)
 
 
+def _unpatchify(latents_patched: torch.Tensor, p: int) -> torch.Tensor:
+    """Inverse of patchify for latent tensors.
+
+    Converts [B, C*(p*p), H, W] -> [B, C, H*p, W*p].
+    """
+
+    if latents_patched.dim() != 4:
+        raise ValueError(
+            f"Expected 4D tensor for unpatchify, got shape {tuple(latents_patched.shape)}"
+        )
+
+    B, Cpp, H, W = latents_patched.shape
+    if (Cpp % (p * p)) != 0:
+        raise ValueError(
+            f"Channel dim {Cpp} must be divisible by p^2={p * p} for unpatchify"
+        )
+
+    C = Cpp // (p * p)
+    latents = latents_patched.view(B, C, p, p, H, W)
+    latents = latents.permute(0, 1, 4, 2, 5, 3).contiguous()
+    latents = latents.view(B, C, H * p, W * p)
+    return latents
+
+
 def _move_to_device(inputs: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
     for key, value in inputs.items():
         if torch.is_tensor(value):
@@ -41,15 +65,32 @@ def _decode_latent(latent: torch.Tensor, image_shape: Tuple[int, int], model) ->
     H, W = image_shape
     h = H // model.latent_downsample
     w = W // model.latent_downsample
-    latent_patch = model.latent_patch_size
-    latent_channel = model.latent_channel
+    if latent.dim() != 2:
+        raise RuntimeError(
+            f"Unexpected latent shape {tuple(latent.shape)}; expected [num_tokens, latent_dim]"
+        )
+    if latent.shape[0] != h * w:
+        raise RuntimeError(
+            f"Latent tokens {latent.shape[0]} do not match grid {h}x{w}"
+        )
 
-    latent = latent.reshape(1, h, w, latent_patch, latent_patch, latent_channel)
-    latent = torch.einsum("nhwpqc->nchpwq", latent)
-    latent = latent.reshape(1, latent_channel, h * latent_patch, w * latent_patch)
-    image = model.vae_model.decode(latent)
-    image = (image * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0).mul(255.0)
-    image = image.to(torch.uint8).cpu().numpy()
+    latent_patch = getattr(model, "latent_patch_size", getattr(model.config, "latent_patch_size", 1))
+    latent_channel = getattr(model, "latent_channel", getattr(model.config, "latent_channel", None))
+    if latent_channel is None:
+        latent_channel = getattr(getattr(model, "vae_model", object()), "latent_channels", None)
+    if latent_channel is None:
+        raise AttributeError("Could not determine latent channels for decoding")
+
+    latent = latent.view(h, w, -1).permute(2, 0, 1).unsqueeze(0)
+    vae_channels = getattr(getattr(model, "vae_model", None), "latent_channels", latent_channel)
+    if latent.shape[1] != vae_channels:
+        latent = _unpatchify(latent, p=latent_patch)
+
+    decoded = model.vae_model.decode(latent)
+    if decoded.min() < 0:
+        decoded = (decoded.clamp(-1, 1) + 1) / 2
+    decoded = decoded.clamp(0, 1)
+    image = (decoded[0] * 255).byte().permute(1, 2, 0).cpu().numpy()
     return Image.fromarray(image)
 
 
