@@ -132,6 +132,7 @@ def fsdp_wrapper(
         backward_prefetch=BackwardPrefetch[fsdp_config.backward_prefetch],
         cpu_offload=CPUOffload(offload_params=cpu_offload),
         device_mesh=device_mesh,
+        use_orig_params=True,
     )
 
 
