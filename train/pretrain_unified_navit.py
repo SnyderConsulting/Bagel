@@ -604,8 +604,11 @@ def main():
             loss_dict["ce"] = ce.detach()
             loss = loss + ce * training_args.ce_weight
         else:
-            assert not training_args.visual_und
-            loss_dict["ce"] = torch.tensor(0, device=device)
+            if training_args.visual_und:
+                logger.warning(
+                    "Received no CE loss despite visual_und=True; skipping CE loss for this batch."
+                )
+            loss_dict["ce"] = torch.tensor(0.0, device=device)
             total_ce_tokens = torch.tensor(0, device=device)
 
         if training_args.visual_gen:
