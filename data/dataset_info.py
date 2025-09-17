@@ -19,5 +19,12 @@ DATASET_REGISTRY = {
 #     "parquet_info_path": "/abs/path/to/parquet_info.json",
 # }
 DATASET_INFO = {
-    'unified_edit': {},
+    'unified_edit': {
+        'breast_edit': {
+            "data_dir": "/workspace/qwen-image-training/data/breast-edit-dataset/parquet",
+            "num_files": 1,
+            "num_total_samples": 52,
+            "parquet_info_path": "/workspace/qwen-image-training/data/breast-edit-dataset/parquet_info.json",
+        },
+    },
 }
