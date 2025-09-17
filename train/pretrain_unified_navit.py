@@ -348,20 +348,30 @@ def main():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     # Setup logging:
+    wandb_run = None
     if dist.get_rank() == 0:
         os.makedirs(training_args.results_dir, exist_ok=True)
         os.makedirs(training_args.checkpoint_dir, exist_ok=True)
         logger = create_logger(training_args.results_dir, dist.get_rank())
-        wandb.init(
-            project=training_args.wandb_project, 
-            id=f"{training_args.wandb_name}-run{training_args.wandb_runid}", 
-            name=training_args.wandb_name, 
-            resume=training_args.wandb_resume,
-            mode="offline" if training_args.wandb_offline else "online"
-        )
-        wandb.config.update(training_args, allow_val_change=True)
-        wandb.config.update(model_args, allow_val_change=True)
-        wandb.config.update(data_args, allow_val_change=True)
+        try:
+            wandb_run = wandb.init(
+                project=training_args.wandb_project,
+                id=f"{training_args.wandb_name}-run{training_args.wandb_runid}",
+                name=training_args.wandb_name,
+                resume=training_args.wandb_resume,
+                mode="offline" if training_args.wandb_offline else "online"
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to initialise Weights & Biases logging (%s). "
+                "Training will proceed without W&B.",
+                exc
+            )
+            wandb_run = None
+        else:
+            wandb.config.update(training_args, allow_val_change=True)
+            wandb.config.update(model_args, allow_val_change=True)
+            wandb.config.update(data_args, allow_val_change=True)
     else:
         logger = create_logger(None, dist.get_rank())
     dist.barrier()
@@ -664,7 +674,7 @@ def main():
             dist.all_reduce(mem_cache, op=dist.ReduceOp.MAX)
             wandb_log['mem_cache'] = mem_cache
 
-            if dist.get_rank() == 0:
+            if dist.get_rank() == 0 and wandb_run is not None:
                 wandb.log(wandb_log, step=curr_step)
             start_time = time()
 
@@ -695,7 +705,7 @@ def main():
             )
 
     logger.info("Done!")
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and wandb_run is not None:
         wandb.finish()
     dist.destroy_process_group()
 
