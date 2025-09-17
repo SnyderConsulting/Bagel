@@ -2,144 +2,228 @@
 from __future__ import annotations
 
 import os
-from contextlib import nullcontext
+from copy import deepcopy
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 from PIL import Image
 
+from data.data_utils import pil_img2rgb
+from modeling.bagel.qwen2_navit import NaiveCache
+
 from .factory import InferenceProcessors
 from .patchify import unpatchify_v1, unpatchify_v2
-from .vae_io import vae_decode, vae_encode
+from .vae_io import vae_decode
+
+
+def load_image(path: str) -> Image.Image:
+    """Load image as RGB with our repo's helper (handles grayscale etc.)."""
+    return pil_img2rgb(Image.open(path))
+
+
+def _move_to_device(inputs: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+    for key, value in inputs.items():
+        if torch.is_tensor(value):
+            inputs[key] = value.to(device)
+    return inputs
+
+
+def _clone_context(ctx: Dict[str, object]) -> Dict[str, object]:
+    return {
+        "kv_lens": list(ctx["kv_lens"]),
+        "ropes": list(ctx["ropes"]),
+        "past_key_values": deepcopy(ctx["past_key_values"]),
+    }
+
+
+def _decode_latent(
+    latent: torch.Tensor,
+    image_shape: Tuple[int, int],
+    model,
+    *,
+    latent_patch_size: int,
+    vae_channels: int,
+    latent_downsample: int,
+) -> Image.Image:
+    """Decode Bagel latent tokens to an RGB image."""
+
+    H, W = image_shape
+    h, w = H // latent_downsample, W // latent_downsample
+
+    if latent.dim() == 2:
+        if latent.shape[0] != h * w:
+            raise RuntimeError(f"Token count {latent.shape[0]} != grid {h}x{w}")
+        latent = latent.view(h, w, -1).permute(2, 0, 1).unsqueeze(0).contiguous()
+    elif latent.dim() != 4:
+        raise RuntimeError(f"Unexpected latent rank {latent.dim()}")
+
+    channels = latent.shape[1]
+    if channels == vae_channels:
+        lat4 = latent
+    elif channels == vae_channels * latent_patch_size * latent_patch_size:
+        lat4 = unpatchify_v1(latent, latent_patch_size)
+        if lat4.shape[1] != vae_channels:
+            lat4 = unpatchify_v2(latent, latent_patch_size)
+        if lat4.shape[1] != vae_channels:
+            raise RuntimeError(
+                f"Unpatchify failed: got C={lat4.shape[1]}, want {vae_channels}"
+            )
+    else:
+        raise RuntimeError(
+            f"Unexpected channels {channels}; expected {vae_channels} or {vae_channels}*p*p"
+        )
+
+    img = vae_decode(model.vae_model, lat4)[0]
+    img = (img * 255.0).round().clamp(0, 255).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+    return Image.fromarray(img)
 
 
 def predict_single_edit(
     model,
-    image_processor,
+    processors: InferenceProcessors,
     ref_path: str,
     input_path: str,
     device: str = "cuda",
     fp16: bool = True,
 ) -> Image.Image:
-    """Generate an edited prediction for a single (reference, input) pair."""
-
-    if image_processor is None:
-        raise ValueError("image_processor is required for predict_single_edit")
+    """Generate an edited prediction for a single (reference, input) pair using Bagel's generate path."""
 
     device_str = str(device)
     if device_str.startswith("cuda") and not torch.cuda.is_available():
-        device_str = "cpu"
-    device_obj = torch.device(device_str)
+        device_obj = torch.device("cpu")
+    else:
+        device_obj = torch.device(device)
 
-    model = model.to(device_obj)
-    model.eval()
+    model = model.to(device_obj).eval()
     if not hasattr(model, "vae_model"):
         raise AttributeError("Model is missing attached VAE model; call build_model first")
     model.vae_model = model.vae_model.to(device_obj).eval()
 
-    ref_img = Image.open(ref_path).convert("RGB")
-    in_img = Image.open(input_path).convert("RGB")
+    amp_enabled = fp16 and device_obj.type == "cuda"
+    amp_dtype = torch.bfloat16 if amp_enabled else torch.float32
 
-    size_cfg = getattr(image_processor, "size", None)
-    crop_cfg = getattr(image_processor, "crop_size", None)
-    size_kw = None
-    if isinstance(size_cfg, dict):
-        if "height" in size_cfg and "width" in size_cfg:
-            size_kw = {
-                "height": int(size_cfg["height"]),
-                "width": int(size_cfg["width"]),
-            }
-        elif "shortest_edge" in size_cfg:
-            se = int(size_cfg["shortest_edge"])
-            size_kw = {"height": se, "width": se}
-    if size_kw is None:
-        size_kw = {"height": 980, "width": 980}
+    # 1) Load images
+    in_img = load_image(input_path)
+    ref_img = load_image(ref_path)
 
-    common = dict(
-        return_tensors="pt",
-        do_resize=True,
-        do_center_crop=False,
-        size=size_kw,
+    # 2) Build initial cache
+    main_ctx: Dict[str, object] = {
+        "kv_lens": [0],
+        "ropes": [0],
+        "past_key_values": NaiveCache(model.config.llm_config.num_hidden_layers),
+    }
+
+    def update_ctx(image: Image.Image) -> Tuple[int, int]:
+        nonlocal main_ctx
+        pkv = main_ctx["past_key_values"]
+        kv_lens = main_ctx["kv_lens"]
+        ropes = main_ctx["ropes"]
+
+        # Stream VAE tokens
+        vae_inp, kv_lens, ropes = model.prepare_vae_images(
+            curr_kvlens=kv_lens,
+            curr_rope=ropes,
+            images=[image],
+            transforms=processors.vae_transform,
+            new_token_ids=processors.new_token_ids,
+        )
+        image_shape = tuple(vae_inp["padded_images"].shape[-2:])
+        vae_inp = _move_to_device(vae_inp, device_obj)
+        with torch.autocast(device_obj.type, enabled=amp_enabled, dtype=amp_dtype):
+            pkv = model.forward_cache_update_vae(model.vae_model, pkv, **vae_inp)
+
+        # Stream ViT tokens
+        vit_inp, kv_lens, ropes = model.prepare_vit_images(
+            curr_kvlens=kv_lens,
+            curr_rope=ropes,
+            images=[image],
+            transforms=processors.vit_transform,
+            new_token_ids=processors.new_token_ids,
+        )
+        vit_inp = _move_to_device(vit_inp, device_obj)
+        with torch.autocast(device_obj.type, enabled=amp_enabled, dtype=amp_dtype):
+            pkv = model.forward_cache_update_vit(pkv, **vit_inp)
+
+        main_ctx = {"past_key_values": pkv, "kv_lens": kv_lens, "ropes": ropes}
+        return image_shape
+
+    # Stream input first (target size), then reference
+    target_shape = update_ctx(in_img)
+    update_ctx(ref_img)
+
+    # 3) CFG contexts
+    cfg_text_ctx = _clone_context(main_ctx)
+    cfg_img_ctx = _clone_context(main_ctx)
+
+    # 4) Prepare latent tokens to be generated
+    gen_inp = model.prepare_vae_latent(
+        curr_kvlens=main_ctx["kv_lens"],
+        curr_rope=main_ctx["ropes"],
+        image_sizes=[target_shape],
+        new_token_ids=processors.new_token_ids,
     )
-    proc_ref = image_processor(images=ref_img, **common)
-    proc_in = image_processor(images=in_img, **common)
-    pv_ref = proc_ref["pixel_values"].to(device_obj)
-    pv_in = proc_in["pixel_values"].to(device_obj)
+    gen_inp = _move_to_device(gen_inp, device_obj)
 
-    np_in = np.array(in_img, dtype=np.float32) / 255.0
-    in_tensor = torch.from_numpy(np_in).permute(2, 0, 1).unsqueeze(0).to(device_obj)
-    in_tensor = in_tensor * 2 - 1
-    z_in = vae_encode(model.vae_model, in_tensor)
-
-    args_list = [
-        {"pixel_values_ref": pv_ref, "pixel_values_inp": pv_in},
-        {"pixel_values": torch.cat([pv_ref, pv_in], dim=0)},
-        {"ref": pv_ref, "inp": pv_in},
-    ]
-    out = None
-
-    autocast_enabled = fp16 and device_obj.type == "cuda"
-    autocast_ctx = (
-        torch.autocast(device_type="cuda", enabled=True) if autocast_enabled else nullcontext()
+    cfg_text_inp = model.prepare_vae_latent_cfg(
+        curr_kvlens=cfg_text_ctx["kv_lens"],
+        curr_rope=cfg_text_ctx["ropes"],
+        image_sizes=[target_shape],
     )
-    with torch.no_grad():
-        with autocast_ctx:
-            for args in args_list:
-                try:
-                    out = model(**args)
-                    break
-                except TypeError:
-                    continue
-    if out is None:
-        raise RuntimeError(
-            "Model.forward signature not recognized; please expose an 'infer_edit' or accept "
-            "(pixel_values_ref, pixel_values_inp)."
+    cfg_text_inp = _move_to_device(cfg_text_inp, device_obj)
+
+    cfg_img_inp = model.prepare_vae_latent_cfg(
+        curr_kvlens=cfg_img_ctx["kv_lens"],
+        curr_rope=cfg_img_ctx["ropes"],
+        image_sizes=[target_shape],
+    )
+    cfg_img_inp = _move_to_device(cfg_img_inp, device_obj)
+
+    # 5) Generate latent tokens
+    with torch.autocast(device_obj.type, enabled=amp_enabled, dtype=amp_dtype):
+        latents = model.generate_image(
+            past_key_values=main_ctx["past_key_values"],
+            cfg_text_past_key_values=cfg_text_ctx["past_key_values"],
+            cfg_img_past_key_values=cfg_img_ctx["past_key_values"],
+            num_timesteps=30,
+            cfg_text_scale=1.0,
+            cfg_img_scale=1.0,
+            cfg_interval=(0.0, 1.0),
+            cfg_renorm_min=0.0,
+            cfg_renorm_type="global",
+            timestep_shift=getattr(model.config, "timestep_shift", 1.0),
+            **gen_inp,
+            cfg_text_packed_position_ids=cfg_text_inp["cfg_packed_position_ids"],
+            cfg_text_packed_query_indexes=cfg_text_inp["cfg_packed_query_indexes"],
+            cfg_text_key_values_lens=cfg_text_inp["cfg_key_values_lens"],
+            cfg_text_packed_key_value_indexes=cfg_text_inp["cfg_packed_key_value_indexes"],
+            cfg_img_packed_position_ids=cfg_img_inp["cfg_packed_position_ids"],
+            cfg_img_packed_query_indexes=cfg_img_inp["cfg_packed_query_indexes"],
+            cfg_img_key_values_lens=cfg_img_inp["cfg_key_values_lens"],
+            cfg_img_packed_key_value_indexes=cfg_img_inp["cfg_packed_key_value_indexes"],
         )
 
-    pred_lat = None
-    if isinstance(out, dict):
-        for key in ("pred_latents", "edit_latents", "gen_latents", "latents", "pred"):
-            value = out.get(key)
-            if torch.is_tensor(value):
-                pred_lat = value
-                break
-    elif torch.is_tensor(out):
-        pred_lat = out
-    if pred_lat is None or pred_lat.ndim != 4:
-        shape = None if pred_lat is None else tuple(pred_lat.shape)
-        raise RuntimeError(
-            f"Predicted latents missing or wrong rank: got {type(out)} with pred_lat={shape}"
-        )
+    latent = latents[0]
 
-    p = getattr(getattr(model, "config", model), "latent_patch_size", 2)
-    vch, vh, vw = z_in.shape[1:]
-    candidates: List[Tuple[str, torch.Tensor]] = []
-    if pred_lat.shape[1] == vch:
-        candidates.append(("abs_direct", pred_lat))
-    if pred_lat.shape[1] == vch * p * p:
-        candidates.append(("abs_unpatch_v1", unpatchify_v1(pred_lat, p)))
-        candidates.append(("abs_unpatch_v2", unpatchify_v2(pred_lat, p)))
-
-    for tag, lat in list(candidates):
-        if lat.shape[2:] == (vh, vw):
-            candidates.append((f"res_{tag}", z_in + lat))
-
-    for tag, lat in candidates:
-        if lat.shape[1:] != (vch, vh, vw):
-            continue
-        decoded = vae_decode(model.vae_model, lat)[0].detach().cpu()
-        decoded = (decoded * 255.0).round().clamp(0, 255).to(torch.uint8)
-        img = decoded.permute(1, 2, 0).numpy()
-        pil = Image.fromarray(img)
-        setattr(pil, "_debug_tag", tag)
-        return pil
-
-    raise RuntimeError(
-        f"No candidate latent matched VAE shape; pred_lat={tuple(pred_lat.shape)}, "
-        f"z_in={tuple(z_in.shape)}, p={p}"
+    # 6) Decode to RGB
+    patch = getattr(getattr(model, "config", model), "latent_patch_size", 2)
+    vae_channels = getattr(getattr(model, "vae_model", None), "latent_channels", 4)
+    downsample = getattr(
+        model,
+        "latent_downsample",
+        getattr(processors.vae_transform, "image_stride", 16),
     )
+
+    img = _decode_latent(
+        latent,
+        target_shape,
+        model,
+        latent_patch_size=patch,
+        vae_channels=vae_channels,
+        latent_downsample=downsample,
+    )
+    setattr(img, "_debug_tag", "bagel_generate")
+    return img
 
 
 def glob_examples(dataset_root: str) -> List[Tuple[str, str, Optional[str]]]:
@@ -189,9 +273,6 @@ def run_batch(
 
     del num_timesteps, cfg_text_scale, cfg_img_scale, cfg_interval  # unused but kept for API
 
-    if processors.image_processor is None:
-        raise ValueError("processors.image_processor is required for run_batch")
-
     os.makedirs(save_dir, exist_ok=True)
     pred_dir = os.path.join(save_dir, "preds")
     os.makedirs(pred_dir, exist_ok=True)
@@ -202,13 +283,13 @@ def run_batch(
         sample_id = Path(in_path).stem
         pred_img = predict_single_edit(
             model,
-            processors.image_processor,
+            processors,
             ref_path,
             in_path,
             device=device,
             fp16=fp16,
         )
-        tag = getattr(pred_img, "_debug_tag", "abs_direct")
+        tag = getattr(pred_img, "_debug_tag", "bagel_generate")
         out_path = os.path.join(pred_dir, f"{sample_id}__{tag}.png")
         pred_img.save(out_path)
         results.append((out_path, gt_path, sample_id))

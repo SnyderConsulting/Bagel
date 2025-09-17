@@ -95,13 +95,13 @@ def main() -> None:
         os.makedirs(args.save_dir, exist_ok=True)
         pred = predict_single_edit(
             model,
-            processors.image_processor,
+            processors,
             args.ref_path,
             args.input_path,
             device=args.device,
             fp16=args.fp16,
         )
-        tag = getattr(pred, "_debug_tag", "abs_direct")
+        tag = getattr(pred, "_debug_tag", "bagel_generate")
         base, ext = os.path.splitext(args.out_name)
         out_path = os.path.join(args.save_dir, f"{base}__{tag}{ext}")
         pred.save(out_path)
