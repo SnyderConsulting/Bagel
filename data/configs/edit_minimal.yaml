@@ -1,0 +1,12 @@
+unified_edit:
+  dataset_names: [<your_dataset_name>]
+  num_used_data: [1]
+  weight: 1
+  image_transform_args:
+    image_stride: 16
+    max_image_size: 512
+    min_image_size: 256
+  vit_image_transform_args:
+    image_stride: 14
+    max_image_size: 350
+    min_image_size: 224
