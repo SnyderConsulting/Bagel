@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from PIL import Image
@@ -185,24 +185,31 @@ def predict_single_edit(
     return _decode_latent(latent, target_shape, model)
 
 
-def glob_pairs(dataset_root: str) -> List[Tuple[str, str, str]]:
-    """Return (reference, input, ground_truth) triples from *dataset_root*."""
+def glob_examples(dataset_root: str) -> List[Tuple[str, str, Optional[str]]]:
+    """Return (reference, input, optional ground truth) triples from *dataset_root*."""
 
     root = Path(dataset_root)
     ref_dir = root / "breast"
     in_dir = root / "input"
     gt_dir = root / "output"
 
-    ids = sorted(p.stem for p in in_dir.glob("*.png"))
-    triples: List[Tuple[str, str, str]] = []
+    if not ref_dir.is_dir() or not in_dir.is_dir():
+        raise FileNotFoundError(f"Expected '{ref_dir}' and '{in_dir}' under {root}")
+
+    ref_ids = {p.stem for p in ref_dir.glob("*.png")}
+    inp_ids = {p.stem for p in in_dir.glob("*.png")}
+    ids = sorted(ref_ids & inp_ids, key=lambda s: (len(s), s))
+
+    has_gt = gt_dir.is_dir()
+    triples: List[Tuple[str, str, Optional[str]]] = []
+    if not has_gt:
+        print(f"[infer] No 'output/' found under {dataset_root}; running inference-only (no metrics).")
     for sample_id in ids:
-        triples.append(
-            (
-                str(ref_dir / f"{sample_id}.png"),
-                str(in_dir / f"{sample_id}.png"),
-                str(gt_dir / f"{sample_id}.png"),
-            )
-        )
+        ref_path = str(ref_dir / f"{sample_id}.png")
+        in_path = str(in_dir / f"{sample_id}.png")
+        gt_candidate = gt_dir / f"{sample_id}.png"
+        gt_path: Optional[str] = str(gt_candidate) if has_gt and gt_candidate.exists() else None
+        triples.append((ref_path, in_path, gt_path))
     return triples
 
 
@@ -219,15 +226,15 @@ def run_batch(
     cfg_text_scale: float = 1.0,
     cfg_img_scale: float = 1.0,
     cfg_interval: Tuple[float, float] = (0.0, 1.0),
-) -> List[Tuple[str, str, str]]:
+) -> List[Tuple[str, Optional[str], str]]:
     """Run inference on every pair in *dataset_root* and save predictions."""
 
     os.makedirs(save_dir, exist_ok=True)
     pred_dir = os.path.join(save_dir, "preds")
     os.makedirs(pred_dir, exist_ok=True)
 
-    triples = glob_pairs(dataset_root)
-    results: List[Tuple[str, str, str]] = []
+    triples = glob_examples(dataset_root)
+    results: List[Tuple[str, Optional[str], str]] = []
     for ref_path, in_path, gt_path in triples:
         sample_id = Path(in_path).stem
         pred = predict_single_edit(
