@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoImageProcessor
 
 from data.data_utils import add_special_tokens
 from data.transforms import ImageTransform
@@ -32,6 +32,7 @@ class InferenceProcessors:
     new_token_ids: Dict[str, int]
     vae_transform: ImageTransform
     vit_transform: ImageTransform
+    image_processor: Optional[AutoImageProcessor] = None
 
 
 def _find_checkpoint_files(
@@ -161,6 +162,7 @@ def load_checkpoint(
 
 def build_processors(
     llm_path: str,
+    vit_path: str,
     *,
     vae_kwargs: Optional[Dict[str, int]] = None,
     vit_kwargs: Optional[Dict[str, int]] = None,
@@ -180,23 +182,32 @@ def build_processors(
     vae_transform = ImageTransform(**vae_defaults)
     vit_transform = ImageTransform(**vit_defaults)
 
+    image_processor = AutoImageProcessor.from_pretrained(
+        vit_path, local_files_only=True, trust_remote_code=False
+    )
+
     return InferenceProcessors(
         tokenizer=tokenizer,
         new_token_ids=new_token_ids,
         vae_transform=vae_transform,
         vit_transform=vit_transform,
+        image_processor=image_processor,
     )
 
 
 def _load_llm_config(llm_path: str) -> Qwen2Config:
-    auto_cfg = AutoConfig.from_pretrained(llm_path, trust_remote_code=True)
+    auto_cfg = AutoConfig.from_pretrained(
+        llm_path, local_files_only=True, trust_remote_code=False
+    )
     if isinstance(auto_cfg, Qwen2Config):
         return auto_cfg
     return Qwen2Config.from_dict(auto_cfg.to_dict())
 
 
 def _load_vit_config(vit_path: str) -> SiglipVisionConfig:
-    auto_cfg = AutoConfig.from_pretrained(vit_path, trust_remote_code=True)
+    auto_cfg = AutoConfig.from_pretrained(
+        vit_path, local_files_only=True, trust_remote_code=False
+    )
     if isinstance(auto_cfg, SiglipVisionConfig):
         return auto_cfg
     return SiglipVisionConfig.from_dict(auto_cfg.to_dict())
