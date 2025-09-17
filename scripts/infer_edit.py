@@ -93,19 +93,17 @@ def main() -> None:
         from bagel_infer.pipeline import predict_single_edit
 
         os.makedirs(args.save_dir, exist_ok=True)
-        out_path = os.path.join(args.save_dir, args.out_name)
         pred = predict_single_edit(
             model,
-            processors,
+            processors.image_processor,
             args.ref_path,
             args.input_path,
             device=args.device,
             fp16=args.fp16,
-            num_timesteps=args.num_timesteps,
-            cfg_text_scale=args.cfg_text_scale,
-            cfg_img_scale=args.cfg_img_scale,
-            cfg_interval=tuple(args.cfg_interval),
         )
+        tag = getattr(pred, "_debug_tag", "abs_direct")
+        base, ext = os.path.splitext(args.out_name)
+        out_path = os.path.join(args.save_dir, f"{base}__{tag}{ext}")
         pred.save(out_path)
         print(f"[infer] wrote {out_path}")
         return
