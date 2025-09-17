@@ -293,6 +293,10 @@ def build_model(
     llm_config.qk_norm = True
     if hasattr(llm_config, "k_norm"):
         llm_config.k_norm = True
+    # Ensure the decoder layers match training (MoT) so *_moe_gen weights load.
+    setattr(llm_config, "layer_module", "Qwen2MoTDecoderLayer")
+    if hasattr(llm_config, "tie_word_embeddings"):
+        llm_config.tie_word_embeddings = False
 
     vit_config = _load_vit_config(vit_path, model_path)
     if hasattr(vit_config, "rope"):
@@ -310,6 +314,10 @@ def build_model(
     bagel_config.vit_max_num_patch_per_side = vit_max_num_patch_per_side
 
     language_model = Qwen2ForCausalLM.from_pretrained(llm_path, config=llm_config)
+    moe_keys_in_model = sum("moe_gen" in k for k in language_model.state_dict().keys())
+    assert (
+        moe_keys_in_model > 0
+    ), "LLM built without MoT; expected *_moe_gen params for checkpoint compatibility."
     vit_model = SiglipVisionModel.from_pretrained(vit_path, config=vit_config)
     if hasattr(vit_model, "vision_model") and hasattr(vit_model.vision_model, "embeddings"):
         converter = getattr(vit_model.vision_model.embeddings, "convert_conv2d_to_linear", None)
